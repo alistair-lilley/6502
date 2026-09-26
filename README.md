@@ -38,8 +38,13 @@ It has 16-bit addressing space ($0000-$FFFF).
 #### Memory Map
 
 $0000-$00FF -- "Zero page" special addressing modes
+
 $0100-$01FF -- System Stack
+
 $0200-$FFFA -- General purpose memory
+
 $FFFA/B -- non-maskable interrupt handler
+
 $FFFC/D -- power on reset location
+
 $FFFE/F -- BRK/interrupt handler
