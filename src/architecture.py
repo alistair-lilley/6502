@@ -80,7 +80,7 @@ class RAM:
     """RAM mapping
     $0000-$00FF -- Zero page
     $0100-$01FF -- Stack
-    $0200-$FFFA -- FREE
+    $0200-$FFFA -- FREE - depends on system
     $FFFA,$FFFB -- non-maskable interrupt handler
     $FFFC,$FFFD -- power on reset location
     $FFFE,$FFFF -- BRK/interrupt handler
@@ -89,21 +89,38 @@ class RAM:
     def __init__(self: RAM) -> None:
         self.ram: npt.NDArray[np.uint8] = np.ndarray(0)
 
-    def __getitem__(self, key: np.uint16):
+    def __getitem__(self, key: Union[np.uint16, np.uint8, int]):
         return self.ram[key]
 
-    def __setitem__(self, key: np.uint16, value: np.uint8):
+    def __setitem__(self, key: Union[np.uint16, np.uint8, int], value: np.uint8):
         self.ram[key] = value
 
-    def set_reset_vector(self: RAM, vector: np.uint8) -> None:
-        self.ram[np.uint8(0xFFFC)] = np.uint8(vector & 0xFF)
-        self.ram[np.uint8(0xFFFD)] = np.uint8((vector >> 16) & 0xFF)
+    def _pad(self: RAM) -> None:
+        self.ram = np.concatenate(
+            self.ram, np.zeros(0x10000 - self.ram.size, dtype=np.uint8)
+        )
+
+    def _set_reset_vector(self: RAM, vector: np.uint8) -> None:
+        self.ram[0xFFFC] = np.uint8(vector & 0xFF)
+        self.ram[0xFFFD] = np.uint8((vector >> 16) & 0xFF)
+
+    def get_word_from_address(
+        self: RAM, address: Union[np.uint8, np.uint16]
+    ) -> np.uint16:
+        lowbyte = self.ram[address]
+        highbyte = self.ram[address + 1]
+        return np.uint16(np.uint16(highbyte) << 8 | np.uint16(lowbyte))
+
+    def load_ROM(self: RAM, ROM: npt.NDArray[np.uint8]) -> None:
+        self.ram = np.concatenate(np.zeros(0x0200, dtype=np.uint8), ROM)
+        self._pad()
+        self._set_reset_vector(np.uint8(0x0200))
 
 
 class CPU:
     """CPU"""
 
-    def __init__(self: CPU, ROM_path: str, verbose: bool) -> None:
+    def __init__(self: CPU, ROM_path: str, verbose: bool = False) -> None:
         # Registers
         self.A = np.uint8(0)  # Accumulator
         self.X = np.uint8(0)  # rX
@@ -114,18 +131,14 @@ class CPU:
         self.PC = np.uint16(0)  # Program Counter
         # RAM
         self.RAM = RAM()
-        ROM = self._load_ROM(ROM_path)
-        self.RAM.ram = np.concatenate(np.zeros(0x0200, dtype=np.uint8), ROM)
-        self.RAM.ram = np.concatenate(
-            self.RAM.ram, np.zeros(0x10000 - self.RAM.ram.size, dtype=np.uint8)
-        )
-        self.RAM.set_reset_vector(np.uint8(0x0200))
+        self.RAM.load_ROM(self._load_ROM(ROM_path))
         # Get reset vector
-        self.PC = self._get_reset_vector_0xFFFC_0xFFFD()
+        self.PC = self.RAM.get_word_from_address(np.uint16(0xFFFC))
         # Opcode-to-function map
         # Value is opcode function and its arguments specifying which version of the opcode to use
         # e.g. ASL zpg,X --> self._asl, address_mode=ZeroPageX
-        # This just makes it so we don't have to write out *every single op code possible*
+        # This just makes it so we don't have to write out *every single op code possible* as
+        # unique functions
         # We can condense some of them
         self.opcode_map: Dict[
             int, Tuple[Callable, Dict[str, Union[AddressMode, Condition]]]
@@ -311,86 +324,98 @@ class CPU:
             file_bytes = rombytefile.read()
             return np.frombuffer(file_bytes, dtype=np.uint8)
 
-    def _get_reset_vector_0xFFFC_0xFFFD(self: CPU) -> np.uint16:
-        return np.uint16(
-            np.uint16(self.RAM[np.uint16(0xFFFD)] << 8)
-            | np.uint16(self.RAM[np.uint16(0xFFFC)])
-        )
-
     def _cycle(self: CPU, count: int) -> None:
         for _ in range(count):
             time.sleep(1 * 10 ^ -6)
 
     def _load_next_opcode(self: CPU, addr: np.uint16) -> np.uint32:
-        bytes = [self.RAM[np.uint16(self.PC + ii)] for ii in range(4)]
+        bytes = [self.RAM[self.PC + ii] for ii in range(4)]
         return np.uint32(
             (bytes[0] << 24) | (bytes[1] << 16) | (bytes[2] << 8) | bytes[3]
         )
 
+    def _get_args_cycles_opbytes(self: CPU) -> Tuple[np.uint8, np.uint16, int, int]:
+        low_byte = np.uint8((self.IR >> 16) & 0xFF)
+        high_byte = np.uint8((self.IR >> 8) & 0xFF)
+        return (
+            low_byte,
+            np.uint16(np.uint16(high_byte) << 8 | np.uint16(low_byte)),
+            0,
+            0,
+        )
+
+    def _cycle_update_pc(self: CPU, cycles: int, opcode_bytes: np.uint16) -> None:
+        self._cycle(cycles)
+        self.PC += opcode_bytes
+
+    def _examine(self: CPU) -> None:
+        pc = self.PC
+        ar = self.A
+        xr = self.X
+        yr = self.Y
+        sp = self.S
+        print(f"| {pc:04} | {ar:02} {xr:02} {yr:02} {sp:02} |")
+
     def fetch_decode_execute(self: CPU) -> None:
         self.IR = self._load_next_opcode(self.PC)
-        opcode: int = int((self.IR >> 24) & 0xFF)  # 8-bit int
+        opcode = int((self.IR >> 24) & 0xFF)  # 8-bit int
         opfunc, opargs = self.opcode_map[opcode]
         opfunc(**opargs)
 
     def main_loop(self: CPU) -> None:
         if self._verbose:
-            print("| INST |             |")
+            print("|------|-------------|")
+            print("| INST |  REGISTERS  |")
             print("| ADDR | AR XR YR SP |")
-        while True:
+            print("|------|-------------|")
+        while not self.P.break_command:
             if self._verbose:
-                self.examine()
+                self._examine()
             self.fetch_decode_execute()
-
-    def _get_args(self: CPU) -> Tuple[np.uint8, np.uint16]:
-        arg1: np.uint8 = np.uint8((self.IR >> 16) & 0xFF)
-        arg2: np.uint8 = np.uint8((self.IR >> 8) & 0xFF)
-        eightbitarg = arg2
-        sixteenbitarg = np.uint16(np.uint16(arg2) << 8 | np.uint16(arg1))
-        return eightbitarg, sixteenbitarg
 
     # Opcode functions
 
     def _adc(self: CPU, address_mode: AddressMode) -> None:
         """Add with carry: A+M+C"""
-        _8bitarg, _16bitarg = self._get_args()
+        byte_arg, word_arg, cycles, opcode_bytes = self._get_args_cycles_opbytes()
         oldA = self.A
-        cycles = 0
-        opcode_bytes = 1
         match address_mode:
             case AddressMode.Immediate:
-                self.A += np.uint8(_8bitarg)
+                self.A += np.uint8(byte_arg)
                 cycles = 2
                 opcode_bytes = 2
             case AddressMode.ZeroPage:
-                self.A += self.RAM[np.uint16(_8bitarg)]
+                self.A += self.RAM[byte_arg]
                 cycles = 3
                 opcode_bytes = 2
             case AddressMode.ZeroPageX:
-                self.A += self.RAM[np.uint16(_8bitarg + self.X)]
+                self.A += self.RAM[byte_arg + self.X]
                 cycles = 4
                 opcode_bytes = 2
             case AddressMode.ZeroPageY:
-                self.A += self.RAM[np.uint16(_8bitarg + self.Y)]
+                self.A += self.RAM[byte_arg + self.Y]
                 cycles = 4
                 opcode_bytes = 2
             case AddressMode.Absolute:
-                self.A += self.RAM[_16bitarg]
+                self.A += self.RAM[word_arg]
                 cycles = 4
                 opcode_bytes = 3
             case AddressMode.AbsoluteX:
-                self.A += self.RAM[np.uint16(_16bitarg + self.X)]
+                self.A += self.RAM[word_arg + self.X]
                 cycles = 4
                 opcode_bytes = 3
             case AddressMode.AbsoluteY:
-                self.A += self.RAM[np.uint16(_16bitarg + self.Y)]
+                self.A += self.RAM[word_arg + self.Y]
                 cycles = 4
                 opcode_bytes = 3
-            # NOTE: Fix later, these ones are weird
-            # case AddressMode.IndirectX:
-            #     self.A += self.RAM[self.RAM[eightbitarg + self.X]]
-            # case AddressMode.IndrectY:
-            #     self.A += self.RAM[self.RAM]
+            case AddressMode.IndirectX:
+                self.A += self.RAM[self.RAM.get_word_from_address(byte_arg + self.X)]
+                cycles = 6
+                opcode_bytes = 2
+            case AddressMode.IndirectY:
+                self.A += self.RAM[self.RAM.get_word_from_address(byte_arg) + self.Y]
+                cycles = 5
+                opcode_bytes = 2
         if oldA > self.A:
             self.P.carry = True
         if self.A == 0:
@@ -398,60 +423,57 @@ class CPU:
         if (self.A >> 7) & 0b1 == 1:
             self.P.negative = True
         # NOTE: Figure out how to write case for setting overflow
-        self._cycle(cycles)
-        self.PC += np.uint16(opcode_bytes)
+        self._cycle_update_pc(cycles, np.uint16(opcode_bytes))
 
     def _and(self: CPU, address_mode: AddressMode) -> None:
         """logical AND: A&M"""
-        _8bitarg, _16bitarg = self._get_args()
-        cycles = 0
-        opcode_bytes = 1
+        byte_arg, word_arg, cycles, opcode_bytes = self._get_args_cycles_opbytes()
         match address_mode:
             case AddressMode.Immediate:
                 cycles = 2
-                self.A &= _8bitarg
+                self.A &= byte_arg
                 opcode_bytes = 2
             case AddressMode.ZeroPage:
                 cycles = 3
-                self.A &= self.RAM[np.uint16(_8bitarg)]
+                self.A &= self.RAM[byte_arg]
                 opcode_bytes = 2
             case AddressMode.ZeroPageX:
                 cycles = 4
-                self.A &= self.RAM[np.uint16(_8bitarg + self.X)]
+                self.A &= self.RAM[byte_arg + self.X]
                 opcode_bytes = 2
             case AddressMode.ZeroPageY:
                 cycles = 4
-                self.A &= self.RAM[np.uint16(_8bitarg + self.Y)]
+                self.A &= self.RAM[byte_arg + self.Y]
                 opcode_bytes = 2
             case AddressMode.Absolute:
                 cycles = 4
-                self.A &= self.RAM[_16bitarg]
+                self.A &= self.RAM[word_arg]
                 opcode_bytes = 3
             case AddressMode.AbsoluteX:
                 cycles = 4
-                self.A &= self.RAM[np.uint16(_16bitarg + self.X)]
+                self.A &= self.RAM[word_arg + self.X]
                 opcode_bytes = 3
             case AddressMode.AbsoluteY:
                 cycles = 4
-                self.A &= self.RAM[np.uint16(_16bitarg + self.Y)]
+                self.A &= self.RAM[word_arg + self.Y]
                 opcode_bytes = 3
-            # NOTE: Fix later, these ones are weird
-            # case AddressMode.IndirectX:
-            #     self.A += self.RAM[self.RAM[eightbitarg + self.X]]
-            # case AddressMode.IndrectY:
-            #     self.A += self.RAM[self.RAM]
+            case AddressMode.IndirectX:
+                self.A &= self.RAM[self.RAM.get_word_from_address(byte_arg + self.X)]
+                cycles = 6
+                opcode_bytes = 2
+            case AddressMode.IndirectY:
+                self.A &= self.RAM[self.RAM.get_word_from_address(byte_arg) + self.Y]
+                cycles = 5
+                opcode_bytes = 2
         if self.A == 0:
             self.P.zero = True
         if (self.A >> 7) & 0b1 == 1:
             self.P.negative = True
-        self._cycle(cycles)
-        self.PC += np.uint16(opcode_bytes)
+        self._cycle_update_pc(cycles, np.uint16(opcode_bytes))
 
     def _asl(self: CPU, address_mode: AddressMode) -> None:
         """Arithmetic shift left: A*2 or M*2"""
-        _8bitarg, _16bitarg = self._get_args()
-        cycles = 0
-        opcode_bytes = 1
+        byte_arg, word_arg, cycles, opcode_bytes = self._get_args_cycles_opbytes()
         match address_mode:
             case AddressMode.Accumulator:
                 self.P.carry = bool((self.A >> 7) & 0b1)
@@ -459,173 +481,340 @@ class CPU:
                 cycles = 2
                 opcode_bytes = 1
             case AddressMode.ZeroPage:
-                self.P.carry = bool((self.RAM[np.uint16(_8bitarg)] >> 7) & 0b1)
-                self.RAM[np.uint16(_8bitarg)] <<= 1
+                self.P.carry = bool((self.RAM[byte_arg] >> 7) & 0b1)
+                self.RAM[byte_arg] <<= 1
                 cycles = 5
                 opcode_bytes = 2
             case AddressMode.ZeroPageX:
-                self.P.carry = bool((self.RAM[np.uint16(_8bitarg + self.X)] >> 7) & 0b1)
-                self.RAM[np.uint16(_8bitarg + self.X)] <<= 1
+                self.P.carry = bool((self.RAM[byte_arg + self.X] >> 7) & 0b1)
+                self.RAM[byte_arg + self.X] <<= 1
                 cycles = 6
                 opcode_bytes = 2
             case AddressMode.Absolute:
-                self.P.carry = bool((self.RAM[_16bitarg] >> 7) & 0b1)
-                self.RAM[_16bitarg] <<= 1
+                self.P.carry = bool((self.RAM[word_arg] >> 7) & 0b1)
+                self.RAM[word_arg] <<= 1
                 cycles = 6
                 opcode_bytes = 3
             case AddressMode.AbsoluteX:
-                self.P.carry = bool(
-                    (self.RAM[np.uint16(_16bitarg + self.X)] >> 7) & 0b1
-                )
-                self.RAM[np.uint16(_16bitarg + self.X)] <<= 1
+                self.P.carry = bool((self.RAM[word_arg + self.X] >> 7) & 0b1)
+                self.RAM[word_arg + self.X] <<= 1
                 cycles = 7
                 opcode_bytes = 3
         if self.A == 0:
             self.P.zero = True
         if (self.A >> 7) & 0b1 == 1:
             self.P.negative = True
-        self._cycle(cycles)
-        self.PC += np.uint16(opcode_bytes)
+        self._cycle_update_pc(cycles, np.uint16(opcode_bytes))
 
     def _bxx(self: CPU, address_mode: AddressMode, condition: Condition) -> None:
         """Branch (relative) if ..."""
-        _8bitarg, _ = self._get_args()
-        cycles = 0
-        opcode_bytes = 2
+        byte_arg, _, cycles, opcode_bytes = self._get_args_cycles_opbytes()
         match address_mode:
             case AddressMode.Relative:
                 match condition:
                     case Condition.CarryClear:  # BCC
                         if not self.P.carry:
-                            self.PC += np.uint16(_8bitarg)
+                            self.PC += np.uint16(byte_arg)
                             cycles = 3
                             opcode_bytes = 0
                         else:
                             cycles = 2
                     case Condition.CarrySet:  # BCS
                         if self.P.carry:
-                            self.PC += np.uint16(_8bitarg)
+                            self.PC += np.uint16(byte_arg)
                             cycles = 3
                             opcode_bytes = 0
                         else:
                             cycles = 2
                     case Condition.ZeroSet:  # BEQ
                         if self.P.zero:
-                            self.PC += np.uint16(_8bitarg)
+                            self.PC += np.uint16(byte_arg)
                             cycles = 3
                             opcode_bytes = 0
                         else:
                             cycles = 2
                     case Condition.NegativeSet:  # BMI
                         if self.P.negative:
-                            self.PC += np.uint16(_8bitarg)
+                            self.PC += np.uint16(byte_arg)
                             cycles = 3
                             opcode_bytes = 0
                         else:
                             cycles = 2
                     case Condition.ZeroClear:  # BNE
                         if not self.P.zero:
-                            self.PC += np.uint16(_8bitarg)
+                            self.PC += np.uint16(byte_arg)
                             cycles = 3
                             opcode_bytes = 0
                         else:
                             cycles = 2
                     case Condition.NegativeClear:  # BPL
                         if not self.P.negative:
-                            self.PC += np.uint16(_8bitarg)
+                            self.PC += np.uint16(byte_arg)
                             cycles = 3
                             opcode_bytes = 0
                         else:
                             cycles = 2
                     case Condition.OverflowClear:  # BVC
                         if not self.P.overflow:
-                            self.PC += np.uint16(_8bitarg)
+                            self.PC += np.uint16(byte_arg)
                             cycles = 3
                             opcode_bytes = 0
                         else:
                             cycles = 2
                     case Condition.OverflowSet:  # BVS
                         if self.P.overflow:
-                            self.PC += np.uint16(_8bitarg)
+                            self.PC += np.uint16(byte_arg)
                             cycles = 3
                             opcode_bytes = 0
                         else:
                             cycles = 2
-        self._cycle(cycles)
-        self.PC += np.uint16(opcode_bytes)
+        self._cycle_update_pc(cycles, np.uint16(opcode_bytes))
 
     def _bit(self: CPU, address_mode: AddressMode) -> None:
         """Test bit"""
-        _8bitarg, _16bitarg = self._get_args()
-        cycles = 0
-        opcode_bytes = 1
+        byte_arg, word_arg, cycles, opcode_bytes = self._get_args_cycles_opbytes()
         match address_mode:
             case AddressMode.ZeroPage:
-                if (self.A & self.RAM[np.uint16(_8bitarg)]) == 0:
+                if (self.A & self.RAM[byte_arg]) == 0:
                     self.P.zero = True
-                self.P.overflow = bool((self.RAM[np.uint16(_8bitarg)] >> 6) & 0b1)
-                self.P.negative = bool((self.RAM[np.uint16(_8bitarg)] >> 7) & 0b1)
+                self.P.overflow = bool((self.RAM[byte_arg] >> 6) & 0b1)
+                self.P.negative = bool((self.RAM[byte_arg] >> 7) & 0b1)
                 opcode_bytes = 2
                 cycles = 3
             case AddressMode.Absolute:
-                if (self.A & self.RAM[_16bitarg]) == 0:
+                if (self.A & self.RAM[word_arg]) == 0:
                     self.P.zero = True
-                self.P.overflow = bool((self.RAM[_16bitarg] >> 6) & 0b1)
-                self.P.negative = bool((self.RAM[_16bitarg] >> 7) & 0b1)
+                self.P.overflow = bool((self.RAM[word_arg] >> 6) & 0b1)
+                self.P.negative = bool((self.RAM[word_arg] >> 7) & 0b1)
                 opcode_bytes = 3
                 cycles = 4
-        self._cycle(cycles)
-        self.PC += np.uint16(opcode_bytes)
+        self._cycle_update_pc(cycles, np.uint16(opcode_bytes))
 
     def _brk(self: CPU) -> None:
         self.P.break_command = True
-        self.PC = np.uint16(
-            np.uint16(self.RAM[np.uint16(0xFFFF)] << 8)
-            | np.uint16(self.RAM[np.uint16(0xFFFE)])
-        )
-        self._cycle(7)
+        self.PC = self.RAM.get_word_from_address(np.uint16(0xFFFE))
+        self._cycle_update_pc(7, np.uint16(0))
 
     def _clc(self: CPU) -> None:
         """Clear Carry"""
         self.P.carry = False
-        self._cycle(2)
-        self.PC += 1
+        self._cycle_update_pc(2, np.uint16(1))
 
     def _cld(self: CPU) -> None:
         """Clear Decimal Mode"""
         self.P.decimal_mode = False
-        self._cycle(2)
-        self.PC += 1
+        self._cycle_update_pc(2, np.uint16(1))
 
     def _cli(self: CPU) -> None:
         """Clear interrupt disable"""
         self.P.interrupt_disable = False
-        self._cycle(2)
-        self.PC += 1
+        self._cycle_update_pc(2, np.uint16(1))
 
     def _clv(self: CPU) -> None:
         """Clear overflow flag"""
         self.P.overflow = False
-        self._cycle(2)
-        self.PC += 1
+        self._cycle_update_pc(2, np.uint16(1))
 
     def _cmp(self: CPU, address_mode=AddressMode) -> None:
-        """Test bit"""
-        _8bitarg, _16bitarg = self._get_args()
-        cycles = 0
-        opcode_bytes = 1
+        """Compare A with M: Z,C,N = A-M"""
+        byte_arg, word_arg, cycles, opcode_bytes = self._get_args_cycles_opbytes()
         match address_mode:
             case AddressMode.Immediate:
-                self.P.carry = bool(self.A > _8bitarg)
-                self.P.zero = bool(self.A - _8bitarg == 0)
-                self.P.negative = bool((np.uint8(self.A - _8bitarg) >> 7) & 0b1)
+                self.P.carry = bool(self.A >= byte_arg)
+                self.P.zero = bool(self.A - byte_arg == 0)
+                self.P.negative = bool((np.uint8(self.A - byte_arg) >> 7) & 0b1)
                 cycles = 2
                 opcode_bytes = 2
+            case AddressMode.ZeroPage:
+                self.P.carry = bool(self.A >= self.RAM[byte_arg])
+                self.P.zero = bool(self.A - self.RAM[byte_arg] == 0)
+                self.P.negative = bool(
+                    (np.uint8(self.A - self.RAM[byte_arg]) >> 7) & 0b1
+                )
+                cycles = 2
+                opcode_bytes = 2
+            case AddressMode.ZeroPageX:
+                self.P.carry = bool(self.A >= self.RAM[byte_arg + self.X])
+                self.P.zero = bool(self.A - self.RAM[byte_arg + self.X] == 0)
+                self.P.negative = bool(
+                    (np.uint8(self.A - self.RAM[byte_arg + self.X]) >> 7) & 0b1
+                )
+                cycles = 4
+                opcode_bytes = 2
+            case AddressMode.Absolute:
+                self.P.carry = bool(self.A >= self.RAM[word_arg])
+                self.P.zero = bool(self.A - self.RAM[word_arg] == 0)
+                self.P.negative = bool(
+                    (np.uint8(self.A - self.RAM[word_arg]) >> 7) & 0b1
+                )
+                cycles = 4
+                opcode_bytes = 3
+            case AddressMode.AbsoluteX:
+                self.P.carry = bool(self.A >= self.RAM[word_arg + self.X])
+                self.P.zero = bool(self.A - self.RAM[word_arg + self.X] == 0)
+                self.P.negative = bool(
+                    (np.uint8(self.A - self.RAM[word_arg + self.X]) >> 7) & 0b1
+                )
+                cycles = 4
+                opcode_bytes = 3
+            case AddressMode.AbsoluteY:
+                self.P.carry = bool(self.A >= self.RAM[word_arg + self.Y])
+                self.P.zero = bool(self.A - self.RAM[word_arg + self.Y] == 0)
+                self.P.negative = bool(
+                    (np.uint8(self.A - self.RAM[word_arg + self.Y]) >> 7) & 0b1
+                )
+                cycles = 4
+                opcode_bytes = 3
+            case AddressMode.IndirectX:
+                self.P.carry = bool(
+                    self.A
+                    >= self.RAM[self.RAM.get_word_from_address(byte_arg + self.X)]
+                )
+                self.P.zero = bool(
+                    self.A - self.RAM[self.RAM.get_word_from_address(byte_arg + self.X)]
+                    == 0
+                )
+                self.P.negative = bool(
+                    (
+                        np.uint8(
+                            self.A - self.RAM.get_word_from_address(byte_arg + self.X)
+                        )
+                        >> 7
+                    )
+                    & 0b1
+                )
+                cycles = 6
+                opcode_bytes = 2
+            case AddressMode.IndirectY:
+                self.P.carry = bool(
+                    self.A
+                    >= self.RAM[self.RAM.get_word_from_address(byte_arg) + self.Y]
+                )
+                self.P.zero = bool(
+                    self.A - self.RAM[self.RAM.get_word_from_address(byte_arg) + self.Y]
+                    == 0
+                )
+                self.P.negative = bool(
+                    (
+                        np.uint8(
+                            self.A - self.RAM.get_word_from_address(byte_arg) + self.Y
+                        )
+                        >> 7
+                    )
+                    & 0b1
+                )
+                cycles = 5
+                opcode_bytes = 2
+        self._cycle_update_pc(cycles, np.uint16(opcode_bytes))
 
-    def examine(self: CPU) -> None:
-        pc = self.PC
-        ar = self.A
-        xr = self.X
-        yr = self.Y
-        sp = self.S
-        print(f"| {pc:04} | {ar:02} {xr:02} {yr:02} {sp:02} |")
+    def _cpx(self: CPU, address_mode: AddressMode) -> None:
+        """Compare X with M: Z,C,N = X-M"""
+        byte_arg, word_arg, cycles, opcode_bytes = self._get_args_cycles_opbytes()
+        match address_mode:
+            case AddressMode.Immediate:
+                self.P.carry = bool(self.X >= byte_arg)
+                self.P.zero = bool(self.X - byte_arg == 0)
+                self.P.negative = bool((np.uint8(self.X - byte_arg) >> 7) & 0b1)
+                cycles = 2
+                opcode_bytes = 2
+            case AddressMode.ZeroPage:
+                self.P.carry = bool(self.X >= self.RAM[byte_arg])
+                self.P.zero = bool(self.X - self.RAM[byte_arg] == 0)
+                self.P.negative = bool(
+                    (np.uint8(self.X - self.RAM[byte_arg]) >> 7) & 0b1
+                )
+                cycles = 3
+                opcode_bytes = 2
+            case AddressMode.Absolute:
+                self.P.carry = bool(self.X >= self.RAM[word_arg])
+                self.P.zero = bool(self.X - self.RAM[word_arg] == 0)
+                self.P.negative = bool(
+                    (np.uint8(self.X - self.RAM[word_arg]) >> 7) & 0b1
+                )
+                cycles = 4
+                opcode_bytes = 3
+        self._cycle_update_pc(cycles, np.uint16(opcode_bytes))
+
+    def _cpy(self: CPU, address_mode: AddressMode) -> None:
+        """Compare Y with M: Z,C,N = Y-M"""
+        byte_arg, word_arg, cycles, opcode_bytes = self._get_args_cycles_opbytes()
+        match address_mode:
+            case AddressMode.Immediate:
+                self.P.carry = bool(self.Y >= byte_arg)
+                self.P.zero = bool(self.Y - byte_arg == 0)
+                self.P.negative = bool((np.uint8(self.Y - byte_arg) >> 7) & 0b1)
+                cycles = 2
+                opcode_bytes = 2
+            case AddressMode.ZeroPage:
+                self.P.carry = bool(self.Y >= self.RAM[byte_arg])
+                self.P.zero = bool(self.Y - self.RAM[byte_arg] == 0)
+                self.P.negative = bool(
+                    (np.uint8(self.Y - self.RAM[byte_arg]) >> 7) & 0b1
+                )
+                cycles = 3
+                opcode_bytes = 2
+            case AddressMode.Absolute:
+                self.P.carry = bool(self.Y >= self.RAM[word_arg])
+                self.P.zero = bool(self.Y - self.RAM[word_arg] == 0)
+                self.P.negative = bool(
+                    (np.uint8(self.Y - self.RAM[word_arg]) >> 7) & 0b1
+                )
+                cycles = 4
+                opcode_bytes = 3
+        self._cycle_update_pc(cycles, np.uint16(opcode_bytes))
+
+    def _dec(self: CPU, address_mode: AddressMode) -> None:
+        """Decrement location in memory"""
+        byte_arg, word_arg, cycles, opcode_bytes = self._get_args_cycles_opbytes()
+        match address_mode:
+            case AddressMode.ZeroPage:
+                self.RAM[byte_arg] -= 1
+                if self.RAM[byte_arg] == 0:
+                    self.P.zero = True
+                if (self.RAM[byte_arg] >> 7) & 0b1 == 1:
+                    self.P.negative = True
+                cycles = 5
+                opcode_bytes = 2
+            case AddressMode.ZeroPageX:
+                self.RAM[byte_arg + self.X] -= 1
+                if self.RAM[byte_arg + self.X] == 0:
+                    self.P.zero = True
+                if (self.RAM[byte_arg + self.X] >> 7) & 0b1 == 1:
+                    self.P.negative = True
+                cycles = 6
+                opcode_bytes = 2
+            case AddressMode.Absolute:
+                self.RAM[word_arg] -= 1
+                if self.RAM[word_arg] == 0:
+                    self.P.zero = True
+                if (self.RAM[word_arg] >> 7) & 0b1 == 1:
+                    self.P.negative = True
+                cycles = 6
+                opcode_bytes = 3
+            case AddressMode.AbsoluteX:
+                self.RAM[word_arg + self.X] -= 1
+                if self.RAM[word_arg + self.X] == 0:
+                    self.P.zero = True
+                if (self.RAM[word_arg + self.X] >> 7) & 0b1 == 1:
+                    self.P.negative = True
+                cycles = 7
+                opcode_bytes = 3
+        self._cycle_update_pc(cycles, np.uint16(opcode_bytes))
+
+    def _dex(self: CPU) -> None:
+        """Decrement X: X,Z,N = X-1"""
+        self.X -= 1
+        if self.X == 0:
+            self.P.zero = True
+        if (self.X >> 7) & 0b1 == 1:
+            self.P.negative = True
+        self._cycle_update_pc(2, np.uint16(1))
+
+    def _dey(self: CPU) -> None:
+        """Decrement Y: X,Z,N = Y-1"""
+        self.Y -= 1
+        if self.Y == 0:
+            self.P.zero = True
+        if (self.Y >> 7) & 0b1 == 1:
+            self.P.negative = True
+        self._cycle_update_pc(2, np.uint16(1))
